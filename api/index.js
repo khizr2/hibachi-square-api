@@ -30,7 +30,25 @@ module.exports = async (req, res) => {
   const SANDBOX_DEVICE_ID = "9fa747a2-25ff-48ee-b078-04381f7c828f";
 
   try {
-    const { lineItems = [] } = req.body;
+    // Ensure JSON parsing
+    const b = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
+    // Normalize line items (accepts different client formats)
+    const cents =
+      Number(b.amountCents ?? b.priceCents ?? b.amount ?? b?.amount_money?.amount);
+
+    if (!Number.isInteger(cents) || cents <= 0) {
+      return res.status(400).json({ step: "create-checkout", error: "Bad amount" });
+    }
+
+    const { lineItems = [
+      {
+        quantity: b.qty || 1,
+        name: b.itemName || "Item",
+        price: cents
+      }
+    ] } = b;
+
 
     // Build line items from request
     const formattedLineItems = lineItems.map(item => ({
