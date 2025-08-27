@@ -33,22 +33,64 @@ module.exports = async (req, res) => {
     const { lineItems = [] } = req.body;
 
     // Build line items from request
-    const formattedLineItems = lineItems.map(item => ({
-      quantity: String(item.quantity || "1"),
-      name: item.name,
-      base_price_money: {
-        amount: item.price,
-        currency: "USD"
-      },
-      modifiers: item.modifiers ? item.modifiers.map(mod => ({
-        name: mod.name,
-        base_price_money: {
-          amount: mod.price,
-          currency: "USD"
+   try {
+    // ✅ Parse body robustly (string or object)
+    const raw = typeof req.body === "string" ? JSON.parse(req.body) : (req.body ?? {});
+
+    // ✅ Accept EITHER full Square payload { order: {...} } OR a simple schema
+    let order = raw.order;
+
+    if (!order) {
+      // Expect: raw.lineItems = [{ name, quantity, price, modifiers?[] }]
+      const inputItems = Array.isArray(raw.lineItems) ? raw.lineItems : [];
+
+      if (inputItems.length === 0) {
+        // Back-compat: allow single-item fields
+        const cents = Number(
+          raw.amountCents ?? raw.priceCents ?? raw.amount ?? raw?.amount_money?.amount
+        );
+        if (!Number.isInteger(cents) || cents <= 0) {
+          return res.status(400).json({ step: "create-order", error: "Bad amount" });
         }
-      })) : [],
-      item_type: "ITEM"
-    }));
+        inputItems.push({
+          name: raw.itemName || "Item",
+          quantity: String(raw.qty ?? 1),
+          price: cents
+        });
+      }
+
+      const formattedLineItems = inputItems.map((it) => ({
+        name: String(it.name || "Item"),
+        quantity: String(it.quantity ?? "1"), // Square requires string
+        base_price_money: {
+          amount: Number(it.price ?? it.amount ?? 0), // integer cents
+          currency: "USD"
+        },
+        modifiers: Array.isArray(it.modifiers)
+          ? it.modifiers.map((m) => ({
+              name: String(m.name || "Modifier"),
+              base_price_money: {
+                amount: Number(m.price ?? 0),
+                currency: "USD"
+              }
+            }))
+          : [],
+        item_type: "ITEM"
+      }));
+
+      order = {
+        location_id: process.env.SQUARE_LOCATION_ID, // always from env
+        line_items: formattedLineItems,
+        taxes: [
+          {
+            type: "ADDITIVE",
+            name: "STATE",
+            percentage: String(raw.taxPercent ?? 7.25)
+          }
+        ],
+        state: "OPEN"
+      };
+    }
 
     // 1) Create Order
     const orderBody = {
