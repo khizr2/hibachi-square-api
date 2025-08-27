@@ -39,6 +39,19 @@ module.exports = async (req, res) => {
 
     // ✅ Accept EITHER full Square payload { order: {...} } OR a simple schema
     let order = raw.order;
+// If client sent a full Square order, normalize & inject location
+if (order) {
+  if (!order.location_id) {
+    order.location_id = process.env.SQUARE_LOCATION_ID;
+  }
+  // Square requires quantity to be a string
+  if (Array.isArray(order.line_items)) {
+    order.line_items = order.line_items.map(li => ({
+      ...li,
+      quantity: String(li.quantity ?? "1")
+    }));
+  }
+}
 
     if (!order) {
       // Expect: raw.lineItems = [{ name, quantity, price, modifiers?[] }]
