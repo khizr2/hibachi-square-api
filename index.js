@@ -1,14 +1,11 @@
 const crypto = require("crypto");
 
 module.exports = async (req, res) => {
-  // Enable CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+  if (req.method === "OPTIONS") return res.status(200).end();
 
   // Health check
   if (req.method === "GET" && req.url === "/api/healthz") {
@@ -20,7 +17,7 @@ module.exports = async (req, res) => {
     return res.status(404).json({ error: "Not found" });
   }
 
-  // Auth check
+  // Auth
   if (req.headers["x-api-key"] !== process.env.VAPI_SHARED_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -30,35 +27,28 @@ module.exports = async (req, res) => {
   const SANDBOX_DEVICE_ID = "9fa747a2-25ff-48ee-b078-04381f7c828f";
 
   try {
-    const { lineItems = [] } = req.body;
-
-    // Build line items from request
-   try {
-    // ✅ Parse body robustly (string or object)
+    // ---------- Parse + normalize input ----------
     const raw = typeof req.body === "string" ? JSON.parse(req.body) : (req.body ?? {});
+    let order = raw.order; // pass-through shape if provided
 
-    // ✅ Accept EITHER full Square payload { order: {...} } OR a simple schema
-    let order = raw.order;
-// If client sent a full Square order, normalize & inject location
-if (order) {
-  if (!order.location_id) {
-    order.location_id = process.env.SQUARE_LOCATION_ID;
-  }
-  // Square requires quantity to be a string
-  if (Array.isArray(order.line_items)) {
-    order.line_items = order.line_items.map(li => ({
-      ...li,
-      quantity: String(li.quantity ?? "1")
-    }));
-  }
-}
+    // If client sent a full Square order, normalize & inject required fields
+    if (order) {
+      if (!order.location_id) order.location_id = process.env.SQUARE_LOCATION_ID;
+      if (!order.state) order.state = "OPEN";
+      if (Array.isArray(order.line_items)) {
+        order.line_items = order.line_items.map((li) => ({
+          ...li,
+          quantity: String(li.quantity ?? "1"), // Square requires string
+        }));
+      }
+    }
 
+    // Otherwise accept simple schema and convert to a Square order
     if (!order) {
-      // Expect: raw.lineItems = [{ name, quantity, price, modifiers?[] }]
+      // Prefer explicit lineItems; otherwise allow single-item backward-compat
       const inputItems = Array.isArray(raw.lineItems) ? raw.lineItems : [];
 
       if (inputItems.length === 0) {
-        // Back-compat: allow single-item fields
         const cents = Number(
           raw.amountCents ?? raw.priceCents ?? raw.amount ?? raw?.amount_money?.amount
         );
@@ -68,81 +58,96 @@ if (order) {
         inputItems.push({
           name: raw.itemName || "Item",
           quantity: String(raw.qty ?? 1),
-          price: cents
+          price: cents,
         });
       }
 
       const formattedLineItems = inputItems.map((it) => ({
         name: String(it.name || "Item"),
-        quantity: String(it.quantity ?? "1"), // Square requires string
+        quantity: String(it.quantity ?? "1"),
         base_price_money: {
           amount: Number(it.price ?? it.amount ?? 0), // integer cents
-          currency: "USD"
+          currency: "USD",
         },
         modifiers: Array.isArray(it.modifiers)
           ? it.modifiers.map((m) => ({
               name: String(m.name || "Modifier"),
               base_price_money: {
                 amount: Number(m.price ?? 0),
-                currency: "USD"
-              }
+                currency: "USD",
+              },
             }))
           : [],
-        item_type: "ITEM"
+        item_type: "ITEM",
       }));
 
       order = {
-        location_id: process.env.SQUARE_LOCATION_ID, // always from env
+        location_id: process.env.SQUARE_LOCATION_ID,
         line_items: formattedLineItems,
         taxes: [
           {
             type: "ADDITIVE",
             name: "STATE",
-            percentage: String(raw.taxPercent ?? 7.25)
-          }
+            percentage: String(raw.taxPercent ?? 7.25),
+          },
         ],
-        state: "OPEN"
+        state: "OPEN",
       };
     }
 
-    // 1) Create Order
+    // ---------- 1) Create Order ----------
     const orderBody = {
       idempotency_key: crypto.randomUUID(),
-      order: {
-        location_id: process.env.SQUARE_LOCATION_ID,
-        line_items: formattedLineItems,
-        taxes: [{
-          type: "ADDITIVE",
-          name: "STATE",
-          percentage: "7.25"
-        }],
-        state: "OPEN"
-      }
+      order,
     };
 
     const orderResp = await fetch(`${SQUARE_BASE}/v2/orders`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.SQUARE_TOKEN_SANDBOX}`,
+        Authorization: `Bearer ${process.env.SQUARE_TOKEN_SANDBOX}`,
         "Square-Version": SQUARE_VER,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(orderBody)
+      body: JSON.stringify(orderBody),
     });
 
     const orderJson = await orderResp.json();
-    
     if (!orderResp.ok) {
-      return res.status(orderResp.status).json({ 
-        step: "create-order", 
-        error: orderJson 
-      });
+      return res.status(orderResp.status).json({ step: "create-order", error: orderJson });
     }
 
     const orderId = orderJson?.order?.id;
-    const dueCents = orderJson?.order?.net_amount_due_money?.amount;
 
-    // 2) Create Terminal Checkout
+    // Square-computed due amount (may be 0 in some pass-through cases)
+    let dueCents = Number(orderJson?.order?.net_amount_due_money?.amount);
+
+    // ---------- Fallback compute if Square returned 0 ----------
+    if (!Number.isInteger(dueCents) || dueCents <= 0) {
+      const li = orderJson?.order?.line_items ?? [];
+      const subTotal = li.reduce((sum, item) => {
+        const base = Number(item?.base_price_money?.amount ?? 0);
+        const mods = (item?.modifiers ?? []).reduce(
+          (mSum, m) => mSum + Number(m?.base_price_money?.amount ?? 0),
+          0
+        );
+        const qty = Number(String(item?.quantity ?? "1")) || 1;
+        return sum + (base + mods) * qty;
+      }, 0);
+
+      const taxes = orderJson?.order?.taxes ?? [];
+      const pct = taxes.reduce((p, t) => p + Number(t?.percentage ?? 0), 0);
+      const taxAmount = Math.round(subTotal * (pct / 100));
+      dueCents = subTotal + taxAmount;
+    }
+
+    // Safety guard
+    if (!Number.isInteger(dueCents) || dueCents <= 0) {
+      return res
+        .status(400)
+        .json({ step: "compute-due", error: "Computed amount must be > 0" });
+    }
+
+    // ---------- 2) Create Terminal Checkout ----------
     const referenceId = `HB-${Math.floor(100000 + Math.random() * 900000)}`;
     const checkoutBody = {
       idempotency_key: crypto.randomUUID(),
@@ -150,32 +155,28 @@ if (order) {
         order_id: orderId,
         amount_money: {
           amount: dueCents,
-          currency: "USD"
+          currency: "USD",
         },
         reference_id: referenceId,
         device_options: {
-          device_id: SANDBOX_DEVICE_ID
-        }
-      }
+          device_id: SANDBOX_DEVICE_ID,
+        },
+      },
     };
 
     const ckResp = await fetch(`${SQUARE_BASE}/v2/terminals/checkouts`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.SQUARE_TOKEN_SANDBOX}`,
+        Authorization: `Bearer ${process.env.SQUARE_TOKEN_SANDBOX}`,
         "Square-Version": SQUARE_VER,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(checkoutBody)
+      body: JSON.stringify(checkoutBody),
     });
 
     const ckJson = await ckResp.json();
-    
     if (!ckResp.ok) {
-      return res.status(ckResp.status).json({ 
-        step: "create-checkout", 
-        error: ckJson 
-      });
+      return res.status(ckResp.status).json({ step: "create-checkout", error: ckJson });
     }
 
     return res.json({
@@ -184,13 +185,10 @@ if (order) {
       dueCents,
       checkoutId: ckJson?.checkout?.id,
       status: ckJson?.checkout?.status,
-      referenceId
+      referenceId,
     });
-
   } catch (error) {
     console.error(error);
-    return res.status(500).json({ 
-      error: error.message || String(error) 
-    });
+    return res.status(500).json({ error: error.message || String(error) });
   }
 };
